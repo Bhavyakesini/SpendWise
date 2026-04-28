@@ -277,7 +277,7 @@ async function fetchExpenses(category: string, sort: SortKey, dateFilter?: DateF
 
   params.set("sort", sort);
 
-  const response = await fetch(`/expenses?${params.toString()}`, {
+  const response = await fetch(`/api/expenses?${params.toString()}`, {
     cache: "no-store"
   });
 
@@ -313,7 +313,7 @@ async function postExpensePayload(payload: ExpensePayload): Promise<CreateExpens
   let response: Response;
 
   try {
-    response = await fetch("/expenses", {
+    response = await fetch("/api/expenses", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -335,7 +335,7 @@ async function postExpensePayload(payload: ExpensePayload): Promise<CreateExpens
 }
 
 async function updateExpensePayload(id: string, payload: ExpensePayload) {
-  const response = await fetch(`/expenses/${id}`, {
+  const response = await fetch(`/api/expenses/${id}`, {
     method: "PATCH",
     headers: {
       "Content-Type": "application/json"
@@ -351,7 +351,7 @@ async function updateExpensePayload(id: string, payload: ExpensePayload) {
 }
 
 async function deleteExpenseRequest(id: string) {
-  const response = await fetch(`/expenses/${id}`, {
+  const response = await fetch(`/api/expenses/${id}`, {
     method: "DELETE"
   });
 
