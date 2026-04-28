@@ -1,0 +1,36 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Expense {
+  id              String       @id @default(cuid())
+  amountPaise     Int
+  category        String
+  description     String
+  date            DateTime
+  createdAt       DateTime     @default(now())
+  clientRequestId String?      @unique
+  requestHash     String?
+  splitShares     SplitShare[]
+
+  @@index([category])
+  @@index([date])
+}
+
+model SplitShare {
+  id          String    @id @default(cuid())
+  expenseId   String
+  friendName  String
+  amountPaise Int
+  settledAt   DateTime?
+  createdAt   DateTime  @default(now())
+  expense     Expense   @relation(fields: [expenseId], references: [id], onDelete: Cascade)
+
+  @@index([friendName])
+  @@index([settledAt])
+}
