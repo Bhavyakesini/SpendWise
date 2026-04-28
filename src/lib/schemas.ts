@@ -22,7 +22,7 @@ const dateOnlySchema = z
 export const createExpenseSchema = z.object({
   amount: moneyInputSchema,
   category: z.string().trim().min(1, "Category is required.").max(60),
-  description: z.string().trim().min(1, "Description is required.").max(180),
+  description: z.string().trim().max(180).optional().default(""),
   date: dateOnlySchema,
   clientRequestId: z.string().uuid().optional(),
   split: z
@@ -48,7 +48,7 @@ export const createExpenseSchema = z.object({
 
 export const expensesQuerySchema = z.object({
   category: z.string().trim().optional(),
-  sort: z.enum(["date_desc", "date_asc", "amount_desc"]).optional()
+  sort: z.enum(["created_desc", "date_desc", "date_asc", "amount_desc"]).optional()
 });
 
 export const updateExpenseSchema = createExpenseSchema.omit({

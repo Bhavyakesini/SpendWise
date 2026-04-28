@@ -19,7 +19,7 @@ export type ReceiptExtraction = {
 
 const CATEGORY_RULES = [
   { pattern: /(grocery|grocer|mart|super|kirana)/i, category: "Groceries" },
-  { pattern: /(cafe|coffee|restaurant|dine|pizza|food|swiggy|zomato|hotel|express|misal|wada)/i, category: "Dining" },
+  { pattern: /(cafe|coffee|restaurant|dine|pizza|food|swiggy|zomato|hotel|express|misal|wada)/i, category: "Food" },
   { pattern: /(uber|ola|taxi|metro|fuel|bus|train)/i, category: "Transport" },
   { pattern: /(pharma|doctor|clinic|health)/i, category: "Health" },
   { pattern: /(movie|ticket|game|event)/i, category: "Entertainment" }

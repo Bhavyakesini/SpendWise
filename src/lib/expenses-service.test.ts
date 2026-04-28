@@ -76,4 +76,20 @@ describe("expenses service list", () => {
     );
     expect(body.totalPaise).toBe(60_000);
   });
+
+  it("can sort by newest saved expense first", async () => {
+    db.findMany.mockResolvedValue([
+      expense({ amountPaise: 10_000, category: "Food" }),
+      expense({ amountPaise: 5_000, category: "Rent" })
+    ]);
+
+    await listExpenses(new URLSearchParams("sort=created_desc"));
+
+    expect(db.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: undefined,
+        orderBy: [{ createdAt: "desc" }, { date: "desc" }]
+      })
+    );
+  });
 });

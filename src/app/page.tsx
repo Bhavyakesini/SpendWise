@@ -57,7 +57,15 @@ type Settlement = {
   expenseCount: number;
 };
 
-type SortKey = "date_desc" | "date_asc" | "amount_desc";
+type SortKey = "created_desc" | "date_desc" | "date_asc" | "amount_desc";
+
+type SmartInsight = {
+  id: string;
+  message: string;
+  expenseId: string | null;
+  category?: string;
+  severity: "info" | "warning" | "critical";
+};
 
 type ExpensePayload = ExpenseFormValues & {
   clientRequestId: string;
@@ -90,7 +98,7 @@ type PendingExpense = {
 
 const DEFAULT_CATEGORIES = [
   "Groceries",
-  "Dining",
+  "Food",
   "Transport",
   "Bills",
   "Health",
@@ -102,14 +110,17 @@ const DEFAULT_CATEGORIES = [
   "Education",
   "Miscellaneous"
 ];
+const HIDDEN_CATEGORIES = new Set(["Dining"]);
 const DRAFT_KEY = "expense-tracker-draft-id";
 const OFFLINE_QUEUE_KEY = "expense-tracker-offline-queue";
-const REVIEW_LIMIT_PAISE = 50_000;
+const ALERT_LIMIT_KEY = "expense-tracker-alert-limit";
+const DEFAULT_REVIEW_LIMIT_INPUT = "500";
+const DEFAULT_REVIEW_LIMIT_PAISE = 50_000;
 
 const expenseFormSchema = z.object({
   amount: z.string().refine((value) => amountToPaise(value) !== null, "Enter a positive amount."),
   category: z.string().trim().min(1, "Choose a category."),
-  description: z.string().trim().min(1, "Add a description.").max(180, "Keep it under 180 characters."),
+  description: z.string().trim().max(180, "Keep it under 180 characters."),
   date: z
     .string()
     .trim()
@@ -120,13 +131,28 @@ const expenseFormSchema = z.object({
 type ExpenseFormValues = z.infer<typeof expenseFormSchema>;
 
 function today() {
-  return new Date().toISOString().slice(0, 10);
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+
+  return `${year}-${month}-${day}`;
+}
+
+function normalizeCategoryOption(category: string) {
+  const trimmed = category.trim();
+
+  if (!trimmed) {
+    return "Groceries";
+  }
+
+  return HIDDEN_CATEGORIES.has(trimmed) ? "Food" : trimmed;
 }
 
 function defaultFormValues(category = "Groceries"): ExpenseFormValues {
   return {
     amount: "",
-    category,
+    category: normalizeCategoryOption(category),
     description: "",
     date: today()
   };
@@ -337,7 +363,7 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const submitLockRef = useRef(false);
   const [categoryFilter, setCategoryFilter] = useState("");
-  const [sort, setSort] = useState<SortKey>("date_desc");
+  const [sort, setSort] = useState<SortKey>("created_desc");
   const [clientRequestId, setClientRequestId] = useState("");
   const [splitEnabled, setSplitEnabled] = useState(false);
   const [splitMode, setSplitMode] = useState<"equal" | "exact">("equal");
@@ -350,6 +376,10 @@ export default function Home() {
   const [editingExpense, setEditingExpense] = useState<Expense | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Expense | null>(null);
   const [isSubmitLocked, setIsSubmitLocked] = useState(false);
+  const [focusedExpenseId, setFocusedExpenseId] = useState<string | null>(null);
+  const [pendingFocusExpenseId, setPendingFocusExpenseId] = useState<string | null>(null);
+  const [isRefreshingData, setIsRefreshingData] = useState(false);
+  const [alertLimitInput, setAlertLimitInput] = useState(DEFAULT_REVIEW_LIMIT_INPUT);
 
   const form = useForm<ExpenseFormValues>({
     resolver: zodResolver(expenseFormSchema),
@@ -376,9 +406,10 @@ export default function Home() {
   const visibleExpenses = expensesQuery.data?.expenses ?? [];
   const allExpenses = allExpensesQuery.data?.expenses ?? [];
   const splitFriends = useMemo(() => uniqueNames(splitNames), [splitNames]);
+  const alertLimitPaise = useMemo(() => amountToPaise(alertLimitInput) ?? DEFAULT_REVIEW_LIMIT_PAISE, [alertLimitInput]);
 
   const categories = useMemo(() => {
-    const dynamic = allExpenses.map((expense) => expense.category);
+    const dynamic = allExpenses.map((expense) => expense.category).filter((category) => !HIDDEN_CATEGORIES.has(category));
     return Array.from(new Set([...DEFAULT_CATEGORIES, ...dynamic])).sort((a, b) => a.localeCompare(b));
   }, [allExpenses]);
 
@@ -400,9 +431,16 @@ export default function Home() {
       .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0]?.id;
   }, [allExpenses]);
 
-  const smartInsights = useMemo(() => {
+  const smartInsights = useMemo<SmartInsight[]>(() => {
     if (allExpenses.length === 0) {
-      return ["No unusual spend yet."];
+      return [
+        {
+          id: "empty",
+          message: "No unusual spend yet.",
+          expenseId: null,
+          severity: "info"
+        }
+      ];
     }
 
     const now = new Date();
@@ -413,10 +451,12 @@ export default function Home() {
     const currentWeek = new Map<string, number>();
     const previousWeek = new Map<string, number>();
     const totals = new Map<string, number>();
+    const categoryExpenses = new Map<string, Expense[]>();
 
     for (const expense of allExpenses) {
       const expenseDate = new Date(`${expense.date}T00:00:00`);
       totals.set(expense.category, (totals.get(expense.category) ?? 0) + expense.amountPaise);
+      categoryExpenses.set(expense.category, [...(categoryExpenses.get(expense.category) ?? []), expense]);
 
       if (expenseDate >= weekStart) {
         currentWeek.set(expense.category, (currentWeek.get(expense.category) ?? 0) + expense.amountPaise);
@@ -425,24 +465,66 @@ export default function Home() {
       }
     }
 
-    const insights: string[] = [];
+    const insights: SmartInsight[] = [];
 
     for (const [category, current] of currentWeek) {
       const previous = previousWeek.get(category) ?? 0;
 
       if (previous > 0 && current >= previous * 1.3) {
-        insights.push(`${category} up ${Math.round(((current - previous) / previous) * 100)}% this week.`);
+        const triggerExpense = (categoryExpenses.get(category) ?? [])
+          .slice()
+          .sort((a, b) => Date.parse(b.date) - Date.parse(a.date) || b.amountPaise - a.amountPaise)[0];
+        insights.push({
+          id: `week-${category}`,
+          message: `${category} up ${Math.round(((current - previous) / previous) * 100)}% this week.`,
+          expenseId: triggerExpense?.id ?? null,
+          category,
+          severity: "warning"
+        });
       }
     }
 
     for (const [category, total] of totals) {
-      if (total >= REVIEW_LIMIT_PAISE) {
-        insights.push(`${category} exceeded ${formatInr(REVIEW_LIMIT_PAISE)} review limit.`);
+      if (total >= alertLimitPaise) {
+        const triggerExpense = (categoryExpenses.get(category) ?? [])
+          .slice()
+          .sort((a, b) => b.amountPaise - a.amountPaise || Date.parse(b.date) - Date.parse(a.date))[0];
+        const isCritical = total >= alertLimitPaise * 2;
+        insights.push({
+          id: `limit-${category}`,
+          message: isCritical
+            ? `${category} is ${formatInr(total)}, over 2x the ${formatInr(alertLimitPaise)} limit.`
+            : `${category} exceeded ${formatInr(alertLimitPaise)} review limit.`,
+          expenseId: triggerExpense?.id ?? null,
+          category,
+          severity: isCritical ? "critical" : "warning"
+        });
       }
     }
 
-    return insights.slice(0, 2).length > 0 ? insights.slice(0, 2) : ["No unusual spend yet."];
-  }, [allExpenses]);
+    return insights.slice(0, 2).length > 0
+      ? insights.slice(0, 2)
+      : [
+          {
+            id: "none",
+            message: "No unusual spend yet.",
+            expenseId: null,
+            severity: "info"
+          }
+        ];
+  }, [alertLimitPaise, allExpenses]);
+
+  const focusExpense = (insight: SmartInsight) => {
+    if (!insight.expenseId) {
+      return;
+    }
+
+    setPendingFocusExpenseId(insight.expenseId);
+    setFocusedExpenseId(insight.expenseId);
+    window.setTimeout(() => {
+      setFocusedExpenseId((current) => (current === insight.expenseId ? null : current));
+    }, 2600);
+  };
 
   const savePendingQueue = (queue: PendingExpense[]) => {
     writePendingQueue(queue);
@@ -461,7 +543,7 @@ export default function Home() {
   };
 
   const resetExpenseForm = (category = getValues("category") || "Groceries") => {
-    reset(defaultFormValues(category));
+    reset(defaultFormValues(normalizeCategoryOption(category)));
     setSplitEnabled(false);
     setSplitMode("equal");
     setSplitNames("");
@@ -473,6 +555,7 @@ export default function Home() {
 
   const buildExpensePayload = (values: ExpenseFormValues): ExpensePayload => ({
     ...values,
+    category: normalizeCategoryOption(values.category),
     clientRequestId,
     split:
       splitEnabled && splitFriends.length > 0
@@ -494,6 +577,9 @@ export default function Home() {
   const handleExpenseSaved = (data: CreateExpenseResponse, showSavedToast = true) => {
     queryClient.invalidateQueries({ queryKey: ["expenses"] });
     queryClient.invalidateQueries({ queryKey: ["settlements"] });
+    setSort("created_desc");
+    setFocusedExpenseId(data.expense.id);
+    setPendingFocusExpenseId(data.expense.id);
 
     if (showSavedToast) {
       toast.success(data.idempotent ? "Already saved from this submission." : "Expense saved.");
@@ -502,6 +588,21 @@ export default function Home() {
     if (data.alert) {
       toast.warning(data.alert.message);
     }
+  };
+
+  const handleAlertLimitChange = (value: string) => {
+    const nextLimit = sanitizeAmount(value);
+    setAlertLimitInput(nextLimit);
+
+    if (amountToPaise(nextLimit)) {
+      window.localStorage.setItem(ALERT_LIMIT_KEY, formatAmountInput(nextLimit));
+    }
+  };
+
+  const handleAlertLimitBlur = () => {
+    const nextLimit = amountToPaise(alertLimitInput) ? formatAmountInput(alertLimitInput) : DEFAULT_REVIEW_LIMIT_INPUT;
+    setAlertLimitInput(nextLimit);
+    window.localStorage.setItem(ALERT_LIMIT_KEY, nextLimit);
   };
 
   const enqueuePendingExpense = (payload: ExpensePayload, lastError?: string) => {
@@ -592,7 +693,7 @@ export default function Home() {
     onSuccess: (payload) => {
       reset({
         amount: formatAmountInput(payload.fields.amount),
-        category: payload.fields.category,
+        category: normalizeCategoryOption(payload.fields.category),
         description: payload.fields.description,
         date: payload.fields.date
       });
@@ -673,6 +774,34 @@ export default function Home() {
     }
   };
 
+  const refreshDashboard = async () => {
+    if (isRefreshingData) {
+      return;
+    }
+
+    setIsRefreshingData(true);
+
+    try {
+      await Promise.all([
+        queryClient.refetchQueries({ queryKey: ["expenses"], type: "active" }),
+        queryClient.refetchQueries({ queryKey: ["settlements"], type: "active" })
+      ]);
+      toast.success("Dashboard refreshed.");
+    } catch {
+      toast.error("Failed to refresh dashboard.");
+    } finally {
+      setIsRefreshingData(false);
+    }
+  };
+
+  const resetDashboardView = () => {
+    setCategoryFilter("");
+    setSort("created_desc");
+    setFocusedExpenseId(null);
+    setPendingFocusExpenseId(null);
+    toast.info("View reset.");
+  };
+
   const openAddDialog = () => {
     resetExpenseForm(getValues("category") || "Groceries");
     setEditingExpense(null);
@@ -683,7 +812,7 @@ export default function Home() {
     setEditingExpense(expense);
     reset({
       amount: formatAmountInput(expense.amount),
-      category: expense.category,
+      category: normalizeCategoryOption(expense.category),
       description: expense.description,
       date: expense.date
     });
@@ -751,6 +880,12 @@ export default function Home() {
     setClientRequestId(nextId);
     setPendingQueue(readPendingQueue());
     setIsOnline(window.navigator.onLine);
+
+    const savedAlertLimit = window.localStorage.getItem(ALERT_LIMIT_KEY);
+
+    if (savedAlertLimit && amountToPaise(savedAlertLimit)) {
+      setAlertLimitInput(formatAmountInput(savedAlertLimit));
+    }
   }, []);
 
   useEffect(() => {
@@ -769,12 +904,32 @@ export default function Home() {
     };
   }, [pendingQueue, isSyncingQueue]);
 
+  useEffect(() => {
+    if (!pendingFocusExpenseId || expensesQuery.isFetching) {
+      return;
+    }
+
+    if (!visibleExpenses.some((expense) => expense.id === pendingFocusExpenseId)) {
+      setPendingFocusExpenseId(null);
+      return;
+    }
+
+    const targets = Array.from(document.querySelectorAll<HTMLElement>(`[data-expense-id="${pendingFocusExpenseId}"]`));
+    const visibleTarget = targets.find((target) => target.offsetParent !== null) ?? targets[0];
+
+    if (visibleTarget) {
+      visibleTarget.scrollIntoView({ behavior: "smooth", block: "center" });
+      setPendingFocusExpenseId(null);
+    }
+  }, [pendingFocusExpenseId, visibleExpenses, expensesQuery.isFetching]);
+
   const currentTotal = expensesQuery.data?.totalPaise ?? 0;
   const isAdding = createExpenseMutation.isPending || (isSubmitLocked && !editingExpense);
   const isSaving = updateExpenseMutation.isPending || (isSubmitLocked && Boolean(editingExpense));
   const isBusy =
     createExpenseMutation.isPending || updateExpenseMutation.isPending || isSyncingQueue || isSubmitLocked || formState.isSubmitting;
   const maxCategoryTotal = Math.max(...categoryTotals.map((item) => item.totalPaise), 1);
+  const expenseErrorMessage = expensesQuery.error instanceof Error ? expensesQuery.error.message : "Failed to load expenses.";
 
   return (
     <main className="min-h-screen">
@@ -782,30 +937,26 @@ export default function Home() {
       <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 px-4 py-5 sm:px-6 lg:px-8">
         <header className="flex flex-col gap-4 border-b border-black/10 pb-5 md:flex-row md:items-center md:justify-between">
           <div>
-            <p className="text-sm font-medium uppercase tracking-[0.14em] text-mint">Personal finance</p>
-            <h1 className="mt-1 text-3xl font-semibold tracking-normal text-ink md:text-4xl">Expense Tracker</h1>
+            <h1 className="text-4xl font-semibold tracking-normal text-ink md:text-5xl">SpendWise</h1>
+            <p className="mt-1 text-base font-medium text-black/55">Track smarter. Spend wiser.</p>
           </div>
-          <div className="grid grid-cols-2 gap-3 sm:flex">
+          <div className="grid grid-cols-2 gap-3 sm:flex sm:items-stretch">
             <button
               type="button"
               onClick={openAddDialog}
-              className="col-span-2 inline-flex min-h-[72px] items-center justify-center gap-2 rounded-md bg-mint px-5 text-sm font-semibold text-white shadow-soft transition hover:bg-[#0d665f] sm:col-span-1"
+              className="col-span-2 inline-flex min-h-[68px] min-w-[220px] items-center justify-center gap-3 rounded-md bg-mint px-9 text-base font-semibold text-white shadow-soft transition hover:bg-[#0d665f] sm:col-span-1"
             >
-              <Plus className="h-4 w-4" />
+              <Plus className="h-5 w-5" />
               Add Expense
             </button>
-            <div className="rounded-md border border-black/10 bg-white px-4 py-3 shadow-soft">
-              <p className="text-xs font-medium text-black/55">Visible total</p>
-              <p className="mt-1 text-xl font-semibold text-ink">{formatInr(currentTotal)}</p>
-            </div>
-            <div className="rounded-md border border-black/10 bg-white px-4 py-3 shadow-soft">
-              <p className="text-xs font-medium text-black/55">Rows</p>
-              <p className="mt-1 text-xl font-semibold text-ink">{visibleExpenses.length}</p>
+            <div className="min-w-[240px] rounded-md border border-black/10 bg-white px-7 py-3.5 shadow-soft">
+              <p className="text-sm font-medium text-black/55">Total</p>
+              <p className="mt-1 text-2xl font-semibold text-ink md:text-3xl">{formatInr(currentTotal)}</p>
             </div>
           </div>
         </header>
 
-        <section className="grid gap-3 md:grid-cols-3">
+        <section className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(420px,1.35fr)_minmax(0,1fr)]">
           <FeatureCard
             title="Offline Queue"
             body={`${pendingQueue.length} pending · ${isOnline ? "Online" : "Offline"}`}
@@ -831,7 +982,7 @@ export default function Home() {
                 type="button"
                 onClick={() => fileInputRef.current?.click()}
                 disabled={ocrMutation.isPending}
-                className="inline-flex min-h-10 items-center gap-2 rounded-md border border-mint/25 px-3 text-sm font-semibold text-mint transition hover:bg-mint/10 disabled:cursor-not-allowed disabled:opacity-60"
+                className="inline-flex min-h-10 items-center gap-2 whitespace-nowrap rounded-md border border-mint/25 px-4 text-sm font-semibold text-mint transition hover:bg-mint/10 disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {ocrMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
                 Scan Receipt
@@ -840,8 +991,9 @@ export default function Home() {
           />
           <FeatureCard
             title="Smart Alerts"
-            body={smartInsights[0]}
-            icon={<AlertTriangle className="h-5 w-5 text-coral" />}
+            body={smartInsights[0].message}
+            icon={<AlertTriangle className={`h-5 w-5 ${severityTextClass(smartInsights[0].severity)}`} />}
+            onClick={smartInsights[0].expenseId ? () => focusExpense(smartInsights[0]) : undefined}
           />
           <input
             ref={fileInputRef}
@@ -862,7 +1014,7 @@ export default function Home() {
         <section className="rounded-md border border-black/10 bg-white p-4 shadow-soft transition sm:p-5">
           <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
             <h2 className="text-lg font-semibold text-ink">Expenses</h2>
-            <div className="grid gap-3 sm:grid-cols-[minmax(180px,240px)_minmax(180px,220px)_auto_auto]">
+            <div className="grid gap-3 sm:grid-cols-[minmax(180px,240px)_minmax(180px,220px)_auto_auto_auto]">
               <label className="relative">
                 <Filter className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-black/45" />
                 <select
@@ -886,6 +1038,7 @@ export default function Home() {
                   onChange={(event) => setSort(event.target.value as SortKey)}
                   className="min-h-10 w-full rounded-md border border-black/15 bg-white pl-9 pr-3 text-sm font-semibold text-ink transition focus:border-mint"
                 >
+                  <option value="created_desc">Newest added</option>
                   <option value="date_desc">Date: newest</option>
                   <option value="date_asc">Date: oldest</option>
                   <option value="amount_desc">Amount: high to low</option>
@@ -894,11 +1047,21 @@ export default function Home() {
 
               <button
                 type="button"
-                onClick={() => expensesQuery.refetch()}
+                onClick={() => void refreshDashboard()}
+                disabled={isRefreshingData}
+                className="inline-flex min-h-10 items-center justify-center gap-2 rounded-md border border-black/15 px-3 text-sm font-semibold text-ink transition hover:bg-black/5 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                <RefreshCw className={`h-4 w-4 ${isRefreshingData || expensesQuery.isFetching ? "animate-spin" : ""}`} />
+                {isRefreshingData ? "Refreshing..." : "Refresh"}
+              </button>
+
+              <button
+                type="button"
+                onClick={resetDashboardView}
                 className="inline-flex min-h-10 items-center justify-center gap-2 rounded-md border border-black/15 px-3 text-sm font-semibold text-ink transition hover:bg-black/5"
               >
-                <RefreshCw className={`h-4 w-4 ${expensesQuery.isFetching ? "animate-spin" : ""}`} />
-                Refresh
+                <RotateCcw className="h-4 w-4" />
+                Reset
               </button>
 
               <button
@@ -930,27 +1093,39 @@ export default function Home() {
                   <TableSkeleton />
                 ) : expensesQuery.isError ? (
                   <tr>
-                    <td className="py-10 text-center text-coral" colSpan={6}>
-                      Failed to load expenses
+                    <td className="py-8" colSpan={6}>
+                      <ExpenseErrorState message={expenseErrorMessage} onRetry={() => void refreshDashboard()} />
                     </td>
                   </tr>
                 ) : visibleExpenses.length === 0 ? (
                   <tr>
                     <td className="py-10 text-center text-black/55" colSpan={6}>
-                      No expenses yet
+                      No expenses yet. Add your first expense.
                     </td>
                   </tr>
                 ) : (
                   visibleExpenses.map((expense) => (
                     <tr
                       key={expense.id}
-                      className={`align-top transition hover:bg-black/[0.025] ${
-                        expense.id === recentExpenseId ? "bg-mint/[0.045]" : ""
+                      data-expense-id={expense.id}
+                      className={`align-top transition hover:bg-mint/[0.05] hover:shadow-sm ${
+                        expense.id === focusedExpenseId
+                          ? "bg-coral/10 ring-2 ring-coral/30"
+                          : expense.id === recentExpenseId
+                            ? "bg-mint/[0.08]"
+                            : ""
                       }`}
                     >
                       <td className="border-b border-black/5 py-4 pr-4 font-medium text-black/65">{expense.date}</td>
                       <td className="border-b border-black/5 px-4 py-4">
-                        <p className="max-w-[280px] font-medium text-ink">{expense.description}</p>
+                        <div className="flex max-w-[280px] flex-wrap items-center gap-2">
+                          <p className="font-medium text-ink">{expense.description || "No description"}</p>
+                          {expense.id === recentExpenseId ? (
+                            <span className="rounded-full bg-mint/10 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-[0.08em] text-mint">
+                              Newest
+                            </span>
+                          ) : null}
+                        </div>
                       </td>
                       <td className="border-b border-black/5 px-4 py-4">
                         <CategoryPill category={expense.category} />
@@ -967,7 +1142,7 @@ export default function Home() {
                             type="button"
                             onClick={() => openEditDialog(expense)}
                             className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-black/10 text-black/65 transition hover:border-mint/30 hover:bg-mint/10 hover:text-mint"
-                            aria-label={`Edit ${expense.description}`}
+                            aria-label={`Edit ${expense.description || "expense"}`}
                           >
                             <Edit3 className="h-4 w-4" />
                           </button>
@@ -975,7 +1150,7 @@ export default function Home() {
                             type="button"
                             onClick={() => setDeleteTarget(expense)}
                             className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-black/10 text-black/65 transition hover:border-coral/30 hover:bg-coral/10 hover:text-coral"
-                            aria-label={`Delete ${expense.description}`}
+                            aria-label={`Delete ${expense.description || "expense"}`}
                           >
                             <Trash2 className="h-4 w-4" />
                           </button>
@@ -999,21 +1174,35 @@ export default function Home() {
                   </div>
                 ))}
               </div>
+            ) : expensesQuery.isError ? (
+              <ExpenseErrorState message={expenseErrorMessage} onRetry={() => void refreshDashboard()} />
             ) : visibleExpenses.length === 0 ? (
               <p className="rounded-md border border-dashed border-black/15 px-3 py-6 text-center text-sm text-black/50">
-                No expenses yet
+                No expenses yet. Add your first expense.
               </p>
             ) : (
               visibleExpenses.map((expense) => (
                 <article
                   key={expense.id}
-                  className={`rounded-md border border-black/10 p-3 transition ${
-                    expense.id === recentExpenseId ? "bg-mint/[0.055]" : "bg-white"
+                  data-expense-id={expense.id}
+                  className={`rounded-md border border-black/10 p-3 transition hover:border-mint/25 hover:shadow-soft ${
+                    expense.id === focusedExpenseId
+                      ? "border-coral/30 bg-coral/10 ring-2 ring-coral/25"
+                      : expense.id === recentExpenseId
+                        ? "border-mint/20 bg-mint/[0.08]"
+                        : "bg-white"
                   }`}
                 >
                   <div className="flex items-start justify-between gap-3">
                     <div>
-                      <p className="text-sm font-semibold text-ink">{expense.description}</p>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="text-sm font-semibold text-ink">{expense.description || "No description"}</p>
+                        {expense.id === recentExpenseId ? (
+                          <span className="rounded-full bg-mint/10 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-[0.08em] text-mint">
+                            Newest
+                          </span>
+                        ) : null}
+                      </div>
                       <p className="mt-1 text-xs font-medium text-black/50">{expense.date}</p>
                     </div>
                     <p className="text-base font-semibold text-ink">{formatInr(expense.amountPaise)}</p>
@@ -1074,13 +1263,45 @@ export default function Home() {
           </section>
 
           <section className="rounded-md border border-black/10 bg-white p-4 shadow-soft sm:p-5">
-            <h2 className="text-lg font-semibold text-ink">Smart Alerts</h2>
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <h2 className="text-lg font-semibold text-ink">Smart Alerts</h2>
+                <p className="mt-1 text-sm font-medium text-black/50">Limit: {formatInr(alertLimitPaise)}</p>
+              </div>
+              <label className="grid gap-1.5 text-xs font-semibold uppercase tracking-[0.12em] text-black/45 sm:w-44">
+                Review limit
+                <div className="relative">
+                  <IndianRupee className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-black/45" />
+                  <input
+                    value={alertLimitInput}
+                    onChange={(event) => handleAlertLimitChange(event.target.value)}
+                    onBlur={handleAlertLimitBlur}
+                    inputMode="decimal"
+                    aria-label="Smart alert review limit"
+                    className="min-h-10 w-full rounded-md border border-black/15 bg-white pl-9 pr-3 text-sm font-semibold tracking-normal text-ink transition focus:border-mint"
+                  />
+                </div>
+              </label>
+            </div>
             <div className="mt-4 grid gap-2">
               {smartInsights.map((insight) => (
-                <div key={insight} className="flex min-h-12 items-start gap-3 rounded-md bg-coral/10 px-3 py-3">
-                  <AlertTriangle className="mt-0.5 h-4 w-4 flex-none text-coral" />
-                  <p className="text-sm font-medium leading-5 text-ink">{insight}</p>
-                </div>
+                <button
+                  key={insight.id}
+                  type="button"
+                  onClick={() => focusExpense(insight)}
+                  disabled={!insight.expenseId}
+                  className={`flex min-h-12 items-start gap-3 rounded-md border px-3 py-3 text-left transition disabled:cursor-default ${severityCardClass(
+                    insight.severity
+                  )}`}
+                >
+                  <AlertTriangle className={`mt-0.5 h-4 w-4 flex-none ${severityTextClass(insight.severity)}`} />
+                  <div>
+                    <p className="text-sm font-semibold leading-5 text-ink">
+                      {insight.severity === "critical" ? "Critical" : insight.severity === "warning" ? "Warning" : "Status"}
+                    </p>
+                    <p className="text-sm font-medium leading-5 text-ink">{insight.message}</p>
+                  </div>
+                </button>
               ))}
             </div>
           </section>
@@ -1293,9 +1514,10 @@ export default function Home() {
                 <button
                   type="submit"
                   disabled={isBusy || !clientRequestId}
-                  className="inline-flex min-h-11 items-center justify-center gap-2 rounded-md bg-mint px-4 text-sm font-semibold text-white transition hover:bg-[#0d665f] disabled:cursor-not-allowed disabled:opacity-60"
+                  aria-busy={isAdding || isSaving}
+                  className="inline-flex min-h-12 items-center justify-center gap-2 rounded-md bg-mint px-5 text-base font-semibold text-white transition hover:bg-[#0d665f] disabled:cursor-not-allowed disabled:opacity-60"
                 >
-                  {isBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+                  {isBusy ? <Loader2 className="h-5 w-5 animate-spin" /> : <Plus className="h-5 w-5" />}
                   {isSaving ? "Saving..." : isAdding ? "Adding..." : editingExpense ? "Save Changes" : "Add Expense"}
                 </button>
                 <button
@@ -1316,6 +1538,11 @@ export default function Home() {
                   Reset
                 </button>
               </div>
+              {isAdding || isSaving ? (
+                <p className="rounded-md bg-mint/10 px-3 py-2 text-sm font-medium text-mint">
+                  {isAdding ? "Adding expense. Please wait..." : "Saving changes. Please wait..."}
+                </p>
+              ) : null}
             </form>
           </section>
         </div>
@@ -1330,10 +1557,11 @@ export default function Home() {
             className="w-full max-w-md rounded-md border border-black/10 bg-white p-5 shadow-soft"
           >
             <h2 id="delete-dialog-title" className="text-lg font-semibold text-ink">
-              Delete Expense
+              Are you sure?
             </h2>
             <p className="mt-2 text-sm leading-6 text-black/60">
-              Delete "{deleteTarget.description}" for {formatInr(deleteTarget.amountPaise)}? This removes its split shares too.
+              Delete "{deleteTarget.description || "this expense"}" for {formatInr(deleteTarget.amountPaise)}? This removes its
+              split shares too.
             </p>
             <div className="mt-5 grid gap-3 sm:grid-cols-2">
               <button
@@ -1364,29 +1592,67 @@ function FeatureCard({
   action,
   body,
   icon,
+  onClick,
   title
 }: {
   action?: React.ReactNode;
   body: string;
   icon: React.ReactNode;
+  onClick?: () => void;
   title: string;
 }) {
-  return (
-    <div className="flex min-h-24 items-center justify-between gap-3 rounded-md border border-black/10 bg-white px-4 py-3 shadow-soft transition hover:-translate-y-0.5 hover:shadow-lg">
-      <div className="flex min-w-0 items-center gap-3">
+  const content = (
+    <>
+      <div className="flex min-w-0 flex-1 items-center gap-3">
         <div className="flex h-10 w-10 flex-none items-center justify-center rounded-md bg-[#f5faf8]">{icon}</div>
         <div className="min-w-0">
           <p className="text-xs font-semibold uppercase tracking-[0.12em] text-black/45">{title}</p>
-          <p className="mt-1 line-clamp-2 text-sm font-semibold text-ink">{body}</p>
+          <p className="mt-1 text-sm font-semibold leading-5 text-ink">{body}</p>
         </div>
       </div>
-      {action}
+      {action ? <div className="flex flex-none justify-end">{action}</div> : null}
+    </>
+  );
+
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        onClick={onClick}
+        className="flex min-h-28 items-center justify-between gap-3 rounded-md border border-black/10 bg-white px-5 py-4 text-left shadow-soft transition hover:-translate-y-0.5 hover:shadow-lg"
+      >
+        {content}
+      </button>
+    );
+  }
+
+  return (
+    <div className="flex min-h-28 items-center justify-between gap-3 rounded-md border border-black/10 bg-white px-5 py-4 shadow-soft transition hover:-translate-y-0.5 hover:shadow-lg">
+      {content}
     </div>
   );
 }
 
 function FieldError({ message }: { message?: string }) {
   return message ? <p className="text-xs font-medium text-coral">{message}</p> : null;
+}
+
+function ExpenseErrorState({ message, onRetry }: { message: string; onRetry: () => void }) {
+  return (
+    <div className="rounded-md border border-coral/25 bg-coral/10 px-4 py-5 text-center">
+      <AlertTriangle className="mx-auto h-5 w-5 text-coral" />
+      <p className="mt-2 text-sm font-semibold text-ink">Failed to load expenses</p>
+      <p className="mt-1 text-sm text-black/60">{message}</p>
+      <button
+        type="button"
+        onClick={onRetry}
+        className="mt-4 inline-flex min-h-10 items-center justify-center gap-2 rounded-md border border-coral/25 bg-white px-3 text-sm font-semibold text-coral transition hover:bg-coral/10"
+      >
+        <RefreshCw className="h-4 w-4" />
+        Retry
+      </button>
+    </div>
+  );
 }
 
 function TableSkeleton() {
@@ -1416,6 +1682,30 @@ function TableSkeleton() {
       ))}
     </>
   );
+}
+
+function severityCardClass(severity: SmartInsight["severity"]) {
+  if (severity === "critical") {
+    return "border-red-200 bg-red-50 hover:bg-red-100 disabled:hover:bg-red-50";
+  }
+
+  if (severity === "warning") {
+    return "border-amber-200 bg-amber-50 hover:bg-amber-100 disabled:hover:bg-amber-50";
+  }
+
+  return "border-black/10 bg-black/[0.03] hover:bg-black/[0.04] disabled:hover:bg-black/[0.03]";
+}
+
+function severityTextClass(severity: SmartInsight["severity"]) {
+  if (severity === "critical") {
+    return "text-red-600";
+  }
+
+  if (severity === "warning") {
+    return "text-amber-600";
+  }
+
+  return "text-black/50";
 }
 
 function CategoryPill({ category }: { category: string }) {

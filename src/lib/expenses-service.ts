@@ -54,7 +54,11 @@ export async function listExpenses(searchParams: URLSearchParams): Promise<Servi
   };
 }
 
-function buildOrderBy(sort: "date_desc" | "date_asc" | "amount_desc" | undefined) {
+function buildOrderBy(sort: "created_desc" | "date_desc" | "date_asc" | "amount_desc" | undefined) {
+  if (sort === "created_desc") {
+    return [{ createdAt: "desc" as const }, { date: "desc" as const }];
+  }
+
   if (sort === "date_asc") {
     return [{ date: "asc" as const }, { createdAt: "asc" as const }];
   }

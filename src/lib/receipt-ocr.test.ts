@@ -28,7 +28,7 @@ describe("receipt OCR parser", () => {
     expect(result.fallback).toBe(false);
     expect(result.fields).toMatchObject({
       amount: "378.00",
-      category: "Dining",
+      category: "Food",
       date: "2025-11-15",
       description: "ZAIKA EXPRESS - MISAL PAV, BATATA WADA, MEDU WADA"
     });
