@@ -92,4 +92,23 @@ describe("expenses service list", () => {
       })
     );
   });
+
+  it("filters by an inclusive expense date range", async () => {
+    db.findMany.mockResolvedValue([
+      expense({ amountPaise: 12_000, category: "Food", date: "2026-04-15" })
+    ]);
+
+    await listExpenses(new URLSearchParams("date_from=2026-04-01&date_to=2026-04-30"));
+
+    expect(db.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          date: {
+            gte: new Date("2026-04-01T00:00:00.000Z"),
+            lte: new Date("2026-04-30T00:00:00.000Z")
+          }
+        }
+      })
+    );
+  });
 });

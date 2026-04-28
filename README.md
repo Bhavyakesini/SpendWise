@@ -5,15 +5,15 @@ A minimal full-stack personal finance app built for the assignment. It supports 
 ## Stack
 
 - Next.js App Router for the frontend and API routes in one repository.
-- Prisma with SQLite for local persistence.
+- Prisma with PostgreSQL for durable persistence.
 - TanStack Query for retries, loading states, cache invalidation, and refresh-friendly UI state.
 - Zod for request validation.
 - Tailwind CSS with small shadcn-style UI primitives and lucide icons.
 - Tesseract.js with local public English trained data for receipt OCR.
 
-## Why SQLite
+## Why PostgreSQL
 
-SQLite keeps local setup tiny and makes the data model explicit through Prisma. Money is stored as integer paise instead of floating point decimals, so totals and splits do not drift. For a hosted production version on Vercel, I would swap the datasource to a persistent hosted database such as Vercel Postgres, Neon, Turso, or PlanetScale because Vercel serverless file storage is not durable.
+PostgreSQL keeps the data durable across deploys and works cleanly with hosted providers such as Neon. Prisma keeps the data model explicit, while money is stored as integer paise instead of floating point decimals so totals and splits do not drift.
 
 ## Features
 
@@ -67,9 +67,12 @@ Also available at `GET /api/expenses`.
 Query params:
 
 - `category=Dining`
+- `sort=created_desc`
 - `sort=date_desc`
 - `sort=date_asc`
 - `sort=amount_desc`
+- `date_from=2026-04-01`
+- `date_to=2026-04-30`
 
 ### `PATCH /expenses/:id`
 
@@ -93,11 +96,9 @@ npm run db:push
 npm run dev
 ```
 
-On PowerShell, use `Copy-Item .env.example .env` for the first command.
+On PowerShell, use `Copy-Item .env.example .env` for the first command. Set `DATABASE_URL` to a Neon or other PostgreSQL connection string before running `npm run db:push`.
 
 Open `http://localhost:3000`.
-
-If Prisma's schema engine is blocked by a local Windows policy, run `npm run db:init` instead of `npm run db:push`; it creates the same SQLite tables from this repository's Prisma model.
 
 ## Test and build
 

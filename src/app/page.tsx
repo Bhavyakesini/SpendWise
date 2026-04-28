@@ -58,6 +58,14 @@ type Settlement = {
 };
 
 type SortKey = "created_desc" | "date_desc" | "date_asc" | "amount_desc";
+type TrendRange = "7d" | "30d" | "6m";
+type AnalyticsTab = "trend" | "yearly";
+
+type DateFilter = {
+  from: string;
+  to: string;
+  label: string;
+};
 
 type SmartInsight = {
   id: string;
@@ -96,6 +104,15 @@ type PendingExpense = {
   lastError?: string;
 };
 
+type TrendPoint = {
+  label: string;
+  shortLabel: string;
+  totalPaise: number;
+  from: string;
+  to: string;
+  isCurrent: boolean;
+};
+
 const DEFAULT_CATEGORIES = [
   "Groceries",
   "Food",
@@ -116,6 +133,12 @@ const OFFLINE_QUEUE_KEY = "expense-tracker-offline-queue";
 const ALERT_LIMIT_KEY = "expense-tracker-alert-limit";
 const DEFAULT_REVIEW_LIMIT_INPUT = "500";
 const DEFAULT_REVIEW_LIMIT_PAISE = 50_000;
+const MONTH_LABELS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const TREND_RANGE_LABELS: Record<TrendRange, string> = {
+  "7d": "Last 7 days",
+  "30d": "Last 30 days",
+  "6m": "Last 6 months"
+};
 
 const expenseFormSchema = z.object({
   amount: z.string().refine((value) => amountToPaise(value) !== null, "Enter a positive amount."),
@@ -131,12 +154,37 @@ const expenseFormSchema = z.object({
 type ExpenseFormValues = z.infer<typeof expenseFormSchema>;
 
 function today() {
+  return toDateOnly(new Date());
+}
+
+function toDateOnly(date: Date) {
   const now = new Date();
-  const year = now.getFullYear();
-  const month = String(now.getMonth() + 1).padStart(2, "0");
-  const day = String(now.getDate()).padStart(2, "0");
+  const value = date || now;
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, "0");
+  const day = String(value.getDate()).padStart(2, "0");
 
   return `${year}-${month}-${day}`;
+}
+
+function addDays(date: Date, days: number) {
+  const next = new Date(date);
+  next.setDate(next.getDate() + days);
+  return next;
+}
+
+function addMonths(date: Date, months: number) {
+  const next = new Date(date);
+  next.setMonth(next.getMonth() + months);
+  return next;
+}
+
+function startOfMonth(date: Date) {
+  return new Date(date.getFullYear(), date.getMonth(), 1);
+}
+
+function endOfMonth(date: Date) {
+  return new Date(date.getFullYear(), date.getMonth() + 1, 0);
 }
 
 function normalizeCategoryOption(category: string) {
@@ -215,11 +263,16 @@ async function readJsonError(response: Response) {
   return payload?.error || "Something went wrong.";
 }
 
-async function fetchExpenses(category: string, sort: SortKey): Promise<ExpensesResponse> {
+async function fetchExpenses(category: string, sort: SortKey, dateFilter?: DateFilter | null): Promise<ExpensesResponse> {
   const params = new URLSearchParams();
 
   if (category) {
     params.set("category", category);
+  }
+
+  if (dateFilter) {
+    params.set("date_from", dateFilter.from);
+    params.set("date_to", dateFilter.to);
   }
 
   params.set("sort", sort);
@@ -358,9 +411,59 @@ function exportCsv(expenses: Expense[]) {
   URL.revokeObjectURL(url);
 }
 
+function sumExpensesBetween(expenses: Expense[], from: string, to: string) {
+  return expenses.reduce((sum, expense) => {
+    return expense.date >= from && expense.date <= to ? sum + expense.amountPaise : sum;
+  }, 0);
+}
+
+function dayLabel(date: Date) {
+  return `${MONTH_LABELS[date.getMonth()]} ${date.getDate()}`;
+}
+
+function buildTrendPoints(expenses: Expense[], range: TrendRange): TrendPoint[] {
+  const now = new Date();
+  const todayValue = toDateOnly(now);
+
+  if (range === "6m") {
+    return Array.from({ length: 6 }, (_, index) => {
+      const monthDate = startOfMonth(addMonths(now, index - 5));
+      const from = toDateOnly(monthDate);
+      const to = toDateOnly(endOfMonth(monthDate));
+      const label = `${MONTH_LABELS[monthDate.getMonth()]} ${monthDate.getFullYear()}`;
+
+      return {
+        label,
+        shortLabel: MONTH_LABELS[monthDate.getMonth()],
+        totalPaise: sumExpensesBetween(expenses, from, to),
+        from,
+        to,
+        isCurrent: monthDate.getMonth() === now.getMonth() && monthDate.getFullYear() === now.getFullYear()
+      };
+    });
+  }
+
+  const length = range === "7d" ? 7 : 30;
+
+  return Array.from({ length }, (_, index) => {
+    const date = addDays(now, index - (length - 1));
+    const dateValue = toDateOnly(date);
+
+    return {
+      label: dayLabel(date),
+      shortLabel: range === "7d" ? dayLabel(date) : String(date.getDate()),
+      totalPaise: sumExpensesBetween(expenses, dateValue, dateValue),
+      from: dateValue,
+      to: dateValue,
+      isCurrent: dateValue === todayValue
+    };
+  });
+}
+
 export default function Home() {
   const queryClient = useQueryClient();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const smartAlertsRef = useRef<HTMLElement | null>(null);
   const submitLockRef = useRef(false);
   const [categoryFilter, setCategoryFilter] = useState("");
   const [sort, setSort] = useState<SortKey>("created_desc");
@@ -380,6 +483,10 @@ export default function Home() {
   const [pendingFocusExpenseId, setPendingFocusExpenseId] = useState<string | null>(null);
   const [isRefreshingData, setIsRefreshingData] = useState(false);
   const [alertLimitInput, setAlertLimitInput] = useState(DEFAULT_REVIEW_LIMIT_INPUT);
+  const [trendRange, setTrendRange] = useState<TrendRange>("6m");
+  const [analyticsTab, setAnalyticsTab] = useState<AnalyticsTab>("trend");
+  const [dateFilter, setDateFilter] = useState<DateFilter | null>(null);
+  const [isSmartAlertsFocused, setIsSmartAlertsFocused] = useState(false);
 
   const form = useForm<ExpenseFormValues>({
     resolver: zodResolver(expenseFormSchema),
@@ -389,8 +496,8 @@ export default function Home() {
   const { control, formState, handleSubmit, register, reset, setValue, getValues } = form;
 
   const expensesQuery = useQuery({
-    queryKey: ["expenses", categoryFilter, sort],
-    queryFn: () => fetchExpenses(categoryFilter, sort)
+    queryKey: ["expenses", categoryFilter, sort, dateFilter?.from ?? "", dateFilter?.to ?? ""],
+    queryFn: () => fetchExpenses(categoryFilter, sort, dateFilter)
   });
 
   const allExpensesQuery = useQuery({
@@ -405,6 +512,8 @@ export default function Home() {
 
   const visibleExpenses = expensesQuery.data?.expenses ?? [];
   const allExpenses = allExpensesQuery.data?.expenses ?? [];
+  const settlements = settlementsQuery.data?.settlements ?? [];
+  const showSettlements = settlementsQuery.isLoading || settlements.length > 0;
   const splitFriends = useMemo(() => uniqueNames(splitNames), [splitNames]);
   const alertLimitPaise = useMemo(() => amountToPaise(alertLimitInput) ?? DEFAULT_REVIEW_LIMIT_PAISE, [alertLimitInput]);
 
@@ -424,6 +533,75 @@ export default function Home() {
       .map(([category, totalPaise]) => ({ category, totalPaise }))
       .sort((a, b) => b.totalPaise - a.totalPaise);
   }, [visibleExpenses]);
+
+  const spendingOverview = useMemo(() => {
+    const now = new Date();
+    const currentYear = now.getFullYear();
+    const currentMonthIndex = now.getMonth();
+    const monthlyTotals = MONTH_LABELS.map((month, index) => ({
+      month,
+      totalPaise: 0,
+      isCurrent: index === currentMonthIndex
+    }));
+    const yearlyTotals = new Map<number, number>();
+
+    for (const expense of allExpenses) {
+      const [yearValue, monthValue] = expense.date.split("-");
+      const year = Number(yearValue);
+      const monthIndex = Number(monthValue) - 1;
+
+      if (!Number.isInteger(year) || monthIndex < 0 || monthIndex > 11) {
+        continue;
+      }
+
+      yearlyTotals.set(year, (yearlyTotals.get(year) ?? 0) + expense.amountPaise);
+
+      if (year === currentYear) {
+        monthlyTotals[monthIndex].totalPaise += expense.amountPaise;
+      }
+    }
+
+    const yearlyBreakdown = Array.from(yearlyTotals.entries())
+      .map(([year, totalPaise]) => ({ year, totalPaise }))
+      .sort((a, b) => b.year - a.year);
+
+    return {
+      currentMonthIndex,
+      currentMonthLabel: `${MONTH_LABELS[currentMonthIndex]} ${currentYear}`,
+      currentMonthTotalPaise: monthlyTotals[currentMonthIndex]?.totalPaise ?? 0,
+      currentYear,
+      currentYearTotalPaise: yearlyTotals.get(currentYear) ?? 0,
+      maxMonthTotalPaise: Math.max(...monthlyTotals.map((item) => item.totalPaise), 1),
+      maxYearTotalPaise: Math.max(...yearlyBreakdown.map((item) => item.totalPaise), 1),
+      monthlyTotals,
+      previousMonthTotalPaise: currentMonthIndex > 0 ? monthlyTotals[currentMonthIndex - 1]?.totalPaise ?? 0 : 0,
+      yearlyBreakdown
+    };
+  }, [allExpenses]);
+
+  const trendAnalytics = useMemo(() => {
+    const points = buildTrendPoints(allExpenses, trendRange);
+    const currentPoint = points.find((point) => point.isCurrent) ?? points[points.length - 1];
+    const currentIndex = Math.max(
+      points.findIndex((point) => point.from === currentPoint?.from && point.to === currentPoint?.to),
+      0
+    );
+    const previousPoint = points[Math.max(currentIndex - 1, 0)];
+    const maxTotalPaise = Math.max(...points.map((point) => point.totalPaise), 1);
+    const highestPoint = points.slice().sort((a, b) => b.totalPaise - a.totalPaise)[0] ?? null;
+    const lowestPoint = points.slice().sort((a, b) => a.totalPaise - b.totalPaise)[0] ?? null;
+    const hasData = points.some((point) => point.totalPaise > 0);
+
+    return {
+      currentPoint,
+      previousPoint,
+      points,
+      maxTotalPaise,
+      highestPoint,
+      lowestPoint,
+      hasData
+    };
+  }, [allExpenses, trendRange]);
 
   const recentExpenseId = useMemo(() => {
     return allExpenses
@@ -524,6 +702,22 @@ export default function Home() {
     window.setTimeout(() => {
       setFocusedExpenseId((current) => (current === insight.expenseId ? null : current));
     }, 2600);
+  };
+
+  const scrollToSmartAlerts = () => {
+    setIsSmartAlertsFocused(true);
+    smartAlertsRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    window.setTimeout(() => setIsSmartAlertsFocused(false), 2200);
+  };
+
+  const applyTrendPointFilter = (point: TrendPoint) => {
+    setDateFilter({
+      from: point.from,
+      to: point.to,
+      label: point.label
+    });
+    setSort("date_desc");
+    toast.info(`Showing expenses for ${point.label}.`);
   };
 
   const savePendingQueue = (queue: PendingExpense[]) => {
@@ -797,6 +991,7 @@ export default function Home() {
   const resetDashboardView = () => {
     setCategoryFilter("");
     setSort("created_desc");
+    setDateFilter(null);
     setFocusedExpenseId(null);
     setPendingFocusExpenseId(null);
     toast.info("View reset.");
@@ -936,9 +1131,16 @@ export default function Home() {
       <Toaster richColors position="top-right" />
       <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 px-4 py-5 sm:px-6 lg:px-8">
         <header className="flex flex-col gap-4 border-b border-black/10 pb-5 md:flex-row md:items-center md:justify-between">
-          <div>
-            <h1 className="text-4xl font-semibold tracking-normal text-ink md:text-5xl">SpendWise</h1>
-            <p className="mt-1 text-base font-medium text-black/55">Track smarter. Spend wiser.</p>
+          <div className="flex items-center gap-4">
+            <img
+              src="/logo.png"
+              alt="SpendWise logo"
+              className="h-16 w-16 flex-none rounded-2xl border border-black/10 bg-white object-cover shadow-soft md:h-20 md:w-20"
+            />
+            <div>
+              <h1 className="text-4xl font-semibold tracking-normal text-ink md:text-5xl">SpendWise</h1>
+              <p className="mt-1 text-base font-medium text-black/55">Track smarter. Spend wiser.</p>
+            </div>
           </div>
           <div className="grid grid-cols-2 gap-3 sm:flex sm:items-stretch">
             <button
@@ -950,7 +1152,7 @@ export default function Home() {
               Add Expense
             </button>
             <div className="min-w-[240px] rounded-md border border-black/10 bg-white px-7 py-3.5 shadow-soft">
-              <p className="text-sm font-medium text-black/55">Total</p>
+              <p className="text-sm font-medium text-black/55">Total expenditure</p>
               <p className="mt-1 text-2xl font-semibold text-ink md:text-3xl">{formatInr(currentTotal)}</p>
             </div>
           </div>
@@ -993,7 +1195,7 @@ export default function Home() {
             title="Smart Alerts"
             body={smartInsights[0].message}
             icon={<AlertTriangle className={`h-5 w-5 ${severityTextClass(smartInsights[0].severity)}`} />}
-            onClick={smartInsights[0].expenseId ? () => focusExpense(smartInsights[0]) : undefined}
+            onClick={scrollToSmartAlerts}
           />
           <input
             ref={fileInputRef}
@@ -1014,7 +1216,7 @@ export default function Home() {
         <section className="rounded-md border border-black/10 bg-white p-4 shadow-soft transition sm:p-5">
           <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
             <h2 className="text-lg font-semibold text-ink">Expenses</h2>
-            <div className="grid gap-3 sm:grid-cols-[minmax(180px,240px)_minmax(180px,220px)_auto_auto_auto]">
+            <div className="grid gap-3 sm:grid-cols-[minmax(180px,240px)_minmax(180px,220px)_auto_auto]">
               <label className="relative">
                 <Filter className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-black/45" />
                 <select
@@ -1047,16 +1249,6 @@ export default function Home() {
 
               <button
                 type="button"
-                onClick={() => void refreshDashboard()}
-                disabled={isRefreshingData}
-                className="inline-flex min-h-10 items-center justify-center gap-2 rounded-md border border-black/15 px-3 text-sm font-semibold text-ink transition hover:bg-black/5 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                <RefreshCw className={`h-4 w-4 ${isRefreshingData || expensesQuery.isFetching ? "animate-spin" : ""}`} />
-                {isRefreshingData ? "Refreshing..." : "Refresh"}
-              </button>
-
-              <button
-                type="button"
                 onClick={resetDashboardView}
                 className="inline-flex min-h-10 items-center justify-center gap-2 rounded-md border border-black/15 px-3 text-sm font-semibold text-ink transition hover:bg-black/5"
               >
@@ -1073,6 +1265,17 @@ export default function Home() {
                 <Download className="h-4 w-4" />
                 CSV
               </button>
+
+              {dateFilter ? (
+                <button
+                  type="button"
+                  onClick={() => setDateFilter(null)}
+                  className="inline-flex min-h-10 items-center justify-center gap-2 rounded-md border border-mint/20 bg-mint/10 px-3 text-sm font-semibold text-mint transition hover:bg-mint/15 sm:col-span-full xl:col-span-1"
+                >
+                  {dateFilter.label}
+                  <X className="h-4 w-4" />
+                </button>
+              ) : null}
             </div>
           </div>
 
@@ -1235,12 +1438,17 @@ export default function Home() {
           </div>
         </section>
 
-        <div className="grid gap-5 xl:grid-cols-2">
-          <section className="rounded-md border border-black/10 bg-white p-4 shadow-soft sm:p-5">
+        <div className="gap-5 xl:columns-2 [&>section]:mb-5 [&>section]:break-inside-avoid">
+          <section
+            ref={smartAlertsRef}
+            className={`rounded-md border bg-white p-4 shadow-soft transition-all duration-300 sm:p-5 ${
+              isSmartAlertsFocused ? "border-coral/35 ring-2 ring-coral/20" : "border-black/10"
+            }`}
+          >
             <h2 className="text-lg font-semibold text-ink">Category Summary</h2>
             <div className="mt-4 grid gap-3">
               {categoryTotals.length === 0 ? (
-                <p className="rounded-md border border-dashed border-black/15 px-3 py-6 text-center text-sm text-black/50">
+                <p className="rounded-md border border-dashed border-black/15 px-3 py-4 text-center text-sm text-black/50">
                   No category totals
                 </p>
               ) : (
@@ -1262,7 +1470,44 @@ export default function Home() {
             </div>
           </section>
 
-          <section className="rounded-md border border-black/10 bg-white p-4 shadow-soft sm:p-5">
+          {showSettlements ? (
+            <section className="rounded-md border border-black/10 bg-white p-4 shadow-soft transition-all duration-300 sm:p-5">
+              <h2 className="text-lg font-semibold text-ink">Settlements</h2>
+              <div className="mt-4 grid gap-2">
+                {settlementsQuery.isLoading ? (
+                  <p className="rounded-md border border-dashed border-black/15 px-3 py-4 text-center text-sm text-black/50">
+                    Loading settlements
+                  </p>
+                ) : (
+                  settlements.map((settlement) => (
+                    <div
+                      key={settlement.friendName}
+                      className="grid gap-3 rounded-md bg-[#f9fbf8] px-3 py-3 sm:grid-cols-[1fr_auto]"
+                    >
+                      <div>
+                        <p className="font-medium text-ink">{settlement.friendName}</p>
+                        <p className="text-sm text-black/55">
+                          Owes {formatInr(settlement.owesUserPaise)} across {settlement.expenseCount} expense
+                          {settlement.expenseCount === 1 ? "" : "s"}
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => settleMutation.mutate(settlement.friendName)}
+                        disabled={settleMutation.isPending}
+                        className="inline-flex min-h-10 items-center justify-center gap-2 rounded-md border border-black/15 px-3 text-sm font-semibold text-ink transition hover:bg-black/5 disabled:opacity-60"
+                      >
+                        <CheckCircle2 className="h-4 w-4" />
+                        Settled
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+            </section>
+          ) : null}
+
+          <section className="rounded-md border border-black/10 bg-white p-4 shadow-soft transition-all duration-300 sm:p-5">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
               <div>
                 <h2 className="text-lg font-semibold text-ink">Smart Alerts</h2>
@@ -1306,44 +1551,93 @@ export default function Home() {
             </div>
           </section>
 
-          <section className="rounded-md border border-black/10 bg-white p-4 shadow-soft sm:p-5 xl:col-span-2">
-            <h2 className="text-lg font-semibold text-ink">Settlements</h2>
-            <div className="mt-4 grid gap-2 md:grid-cols-2">
-              {settlementsQuery.isLoading ? (
-                <p className="rounded-md border border-dashed border-black/15 px-3 py-6 text-center text-sm text-black/50">
-                  Loading settlements
-                </p>
-              ) : (settlementsQuery.data?.settlements ?? []).length === 0 ? (
-                <p className="rounded-md border border-dashed border-black/15 px-3 py-6 text-center text-sm text-black/50 md:col-span-2">
-                  No pending balances
-                </p>
-              ) : (
-                settlementsQuery.data?.settlements.map((settlement) => (
-                  <div
-                    key={settlement.friendName}
-                    className="grid gap-3 rounded-md bg-[#f9fbf8] px-3 py-3 sm:grid-cols-[1fr_auto]"
+          <section className="rounded-md border border-black/10 bg-white p-4 shadow-soft transition-all duration-300 sm:p-5">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 className="text-lg font-semibold text-ink">Spending Analytics</h2>
+                <p className="mt-1 text-sm font-medium text-black/50">All saved expenses</p>
+              </div>
+              <div className="grid grid-cols-2 rounded-md border border-black/10 bg-white p-1">
+                {(["trend", "yearly"] as const).map((tab) => (
+                  <button
+                    key={tab}
+                    type="button"
+                    onClick={() => setAnalyticsTab(tab)}
+                    className={`min-h-9 rounded px-3 text-sm font-semibold transition ${
+                      analyticsTab === tab ? "bg-ink text-white" : "text-black/60 hover:bg-black/5"
+                    }`}
                   >
-                    <div>
-                      <p className="font-medium text-ink">{settlement.friendName}</p>
-                      <p className="text-sm text-black/55">
-                        Owes {formatInr(settlement.owesUserPaise)} across {settlement.expenseCount} expense
-                        {settlement.expenseCount === 1 ? "" : "s"}
-                      </p>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => settleMutation.mutate(settlement.friendName)}
-                      disabled={settleMutation.isPending}
-                      className="inline-flex min-h-10 items-center justify-center gap-2 rounded-md border border-black/15 px-3 text-sm font-semibold text-ink transition hover:bg-black/5 disabled:opacity-60"
-                    >
-                      <CheckCircle2 className="h-4 w-4" />
-                      Settled
-                    </button>
-                  </div>
-                ))
-              )}
+                    {tab === "trend" ? "Trend" : "Yearly"}
+                  </button>
+                ))}
+              </div>
             </div>
+
+            <div className="mt-4 grid gap-3 sm:grid-cols-2">
+              <div className="rounded-md bg-[#f9fbf8] px-3 py-3">
+                <p className="text-xs font-semibold uppercase tracking-[0.12em] text-black/45">This month</p>
+                <p className="mt-1 text-sm font-medium text-black/55">{spendingOverview.currentMonthLabel}</p>
+                <p className="mt-2 text-xl font-semibold text-ink">
+                  {formatInr(spendingOverview.currentMonthTotalPaise)}
+                </p>
+              </div>
+              <div className="rounded-md bg-[#f9fbf8] px-3 py-3">
+                <p className="text-xs font-semibold uppercase tracking-[0.12em] text-black/45">This year</p>
+                <p className="mt-1 text-sm font-medium text-black/55">{spendingOverview.currentYear}</p>
+                <p className="mt-2 text-xl font-semibold text-ink">
+                  {formatInr(spendingOverview.currentYearTotalPaise)}
+                </p>
+              </div>
+            </div>
+
+            {analyticsTab === "trend" ? (
+              <div className="mt-4 rounded-md border border-mint/15 bg-[#f6fbf9] px-3 py-3">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-[0.12em] text-black/45">Spending trend</p>
+                    <p className="mt-1 text-sm font-semibold text-ink">
+                      {formatTrendChange(trendAnalytics.currentPoint?.totalPaise ?? 0, trendAnalytics.previousPoint?.totalPaise ?? 0)}
+                    </p>
+                  </div>
+                  <select
+                    value={trendRange}
+                    onChange={(event) => setTrendRange(event.target.value as TrendRange)}
+                    className="min-h-9 rounded-md border border-black/15 bg-white px-3 text-sm font-semibold text-ink transition focus:border-mint"
+                    aria-label="Trend range"
+                  >
+                    {(["7d", "30d", "6m"] as const).map((range) => (
+                      <option key={range} value={range}>
+                        {TREND_RANGE_LABELS[range]}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <SpendingTrendChart
+                  points={trendAnalytics.points}
+                  maxTotalPaise={trendAnalytics.maxTotalPaise}
+                  currentPoint={trendAnalytics.currentPoint}
+                  hasData={trendAnalytics.hasData}
+                  onPointClick={applyTrendPointFilter}
+                />
+
+                {trendAnalytics.hasData ? (
+                  <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                    <ComparisonPill label="Highest spending" point={trendAnalytics.highestPoint} />
+                    <ComparisonPill label="Lowest spending" point={trendAnalytics.lowestPoint} />
+                  </div>
+                ) : null}
+              </div>
+            ) : (
+              <div className="mt-4">
+                <YearlyExpensesPanel
+                  items={spendingOverview.yearlyBreakdown}
+                  maxTotalPaise={spendingOverview.maxYearTotalPaise}
+                />
+              </div>
+            )}
           </section>
+
         </div>
       </div>
 
@@ -1681,6 +1975,266 @@ function TableSkeleton() {
         </tr>
       ))}
     </>
+  );
+}
+
+function formatTrendChange(currentPaise: number, previousPaise: number) {
+  const changePaise = currentPaise - previousPaise;
+
+  if (changePaise > 0) {
+    if (previousPaise > 0) {
+      return `↑ ${Math.round((changePaise / previousPaise) * 100)}% vs previous (+${formatInr(changePaise)})`;
+    }
+
+    return `↑ New spend (+${formatInr(changePaise)})`;
+  }
+
+  if (changePaise < 0) {
+    if (previousPaise > 0) {
+      return `↓ ${Math.round((Math.abs(changePaise) / previousPaise) * 100)}% vs previous (-${formatInr(Math.abs(changePaise))})`;
+    }
+
+    return `↓ ${formatInr(Math.abs(changePaise))} vs previous`;
+  }
+
+  return "No change vs previous";
+}
+
+function roundAxisValue(value: number) {
+  if (value <= 0) {
+    return 0;
+  }
+
+  const magnitude = 10 ** Math.max(0, String(Math.floor(value)).length - 2);
+  return Math.ceil(value / magnitude) * magnitude;
+}
+
+function formatCompactInr(paise: number) {
+  const rupees = paise / 100;
+
+  if (rupees >= 100_000) {
+    return `₹${(rupees / 100_000).toFixed(1)}L`;
+  }
+
+  if (rupees >= 1_000) {
+    return `₹${Math.round(rupees / 1_000)}k`;
+  }
+
+  return `₹${Math.round(rupees)}`;
+}
+
+function buildSmoothPath(points: Array<{ x: number; y: number }>) {
+  if (points.length === 0) {
+    return "";
+  }
+
+  if (points.length === 1) {
+    return `M ${points[0].x} ${points[0].y}`;
+  }
+
+  return points.reduce((path, point, index, list) => {
+    if (index === 0) {
+      return `M ${point.x} ${point.y}`;
+    }
+
+    const previous = list[index - 1];
+    const controlDistance = (point.x - previous.x) * 0.45;
+    return `${path} C ${previous.x + controlDistance} ${previous.y}, ${point.x - controlDistance} ${point.y}, ${point.x} ${point.y}`;
+  }, "");
+}
+
+function ComparisonPill({ label, point }: { label: string; point: TrendPoint | null }) {
+  return (
+    <div className="rounded-md border border-black/10 bg-white px-3 py-2">
+      <p className="text-xs font-semibold uppercase tracking-[0.12em] text-black/45">{label}</p>
+      <p className="mt-1 text-sm font-semibold text-ink">
+        {point ? `${formatInr(point.totalPaise)} in ${point.label}` : "No spending data"}
+      </p>
+    </div>
+  );
+}
+
+function SpendingTrendChart({
+  currentPoint,
+  hasData,
+  maxTotalPaise,
+  onPointClick,
+  points
+}: {
+  currentPoint?: TrendPoint;
+  hasData: boolean;
+  maxTotalPaise: number;
+  onPointClick: (point: TrendPoint) => void;
+  points: TrendPoint[];
+}) {
+  const [hoveredPoint, setHoveredPoint] = useState<TrendPoint | null>(null);
+  const width = 240;
+  const height = 84;
+  const topPadding = 10;
+  const bottomPadding = 18;
+  const usableHeight = height - topPadding - bottomPadding;
+  const safeMax = Math.max(maxTotalPaise, 1);
+  const chartPoints = points.map((point, index) => {
+    const x = points.length <= 1 ? 0 : (index / (points.length - 1)) * width;
+    const y = height - bottomPadding - (point.totalPaise / safeMax) * usableHeight;
+    return { ...point, x, y };
+  });
+  const linePath = buildSmoothPath(chartPoints);
+  const areaPath = `${linePath} L ${width} ${height} L 0 ${height} Z`;
+  const activePoint =
+    chartPoints.find((point) => currentPoint && point.from === currentPoint.from && point.to === currentPoint.to) ??
+    chartPoints[chartPoints.length - 1];
+  const tooltipPoint = chartPoints.find((point) => hoveredPoint && point.from === hoveredPoint.from && point.to === hoveredPoint.to);
+  const yAxisMax = roundAxisValue(safeMax);
+  const yAxisMid = Math.round(yAxisMax / 2);
+  const shouldShowLabel = (index: number) => points.length <= 7 || index === 0 || index === points.length - 1 || index % 5 === 0;
+
+  return (
+    <div className="mt-3 rounded-md bg-white/75 px-3 py-3">
+      {!hasData ? (
+        <div className="grid min-h-40 place-items-center rounded-md border border-dashed border-black/15 text-sm font-medium text-black/50">
+          No spending data available yet
+        </div>
+      ) : (
+        <div className="grid grid-cols-[44px_1fr] gap-2">
+          <div className="flex h-40 flex-col justify-between py-1 text-right text-[11px] font-semibold text-black/45">
+            <span>{formatCompactInr(yAxisMax)}</span>
+            <span>{formatCompactInr(yAxisMid)}</span>
+            <span>{formatCompactInr(0)}</span>
+          </div>
+          <div className="relative">
+            {tooltipPoint ? (
+              <div
+                className="pointer-events-none absolute z-10 -translate-x-1/2 rounded-md border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-ink shadow-soft"
+                style={{
+                  left: `${(tooltipPoint.x / width) * 100}%`,
+                  top: `${Math.max(0, (tooltipPoint.y / height) * 100 - 18)}%`
+                }}
+              >
+                {tooltipPoint.label}: {formatInr(tooltipPoint.totalPaise)}
+              </div>
+            ) : null}
+            <svg className="h-40 w-full overflow-visible" viewBox={`0 0 ${width} ${height}`} role="img">
+              <title>Spending trend</title>
+              <defs>
+                <linearGradient id="trend-stroke" x1="0" x2="1" y1="0" y2="0">
+                  <stop offset="0%" stopColor="#3bb8a5" />
+                  <stop offset="100%" stopColor="#0f766e" />
+                </linearGradient>
+                <linearGradient id="trend-fill" x1="0" x2="0" y1="0" y2="1">
+                  <stop offset="0%" stopColor="#128477" stopOpacity="0.16" />
+                  <stop offset="100%" stopColor="#128477" stopOpacity="0" />
+                </linearGradient>
+              </defs>
+              {[topPadding, topPadding + usableHeight / 2, height - bottomPadding].map((y) => (
+                <line key={y} x1="0" x2={width} y1={y} y2={y} stroke="#000" strokeOpacity="0.06" strokeWidth="1" />
+              ))}
+              <path d={areaPath} fill="url(#trend-fill)" />
+              <path
+                d={linePath}
+                fill="none"
+                stroke="url(#trend-stroke)"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth="1.6"
+              />
+              {chartPoints.map((point, index) => {
+                const isCurrent = activePoint && point.from === activePoint.from && point.to === activePoint.to;
+
+                return (
+                  <g
+                    key={`${point.from}-${point.to}-${index}`}
+                    role="button"
+                    tabIndex={0}
+                    aria-label={`${point.label}: ${formatInr(point.totalPaise)}`}
+                    onClick={() => onPointClick(point)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        onPointClick(point);
+                      }
+                    }}
+                    onFocus={() => setHoveredPoint(point)}
+                    onBlur={() => setHoveredPoint(null)}
+                    onMouseEnter={() => setHoveredPoint(point)}
+                    onMouseLeave={() => setHoveredPoint(null)}
+                    className="cursor-pointer"
+                  >
+                    <circle
+                      cx={point.x}
+                      cy={point.y}
+                      r={isCurrent ? 4.4 : 3}
+                      fill={isCurrent ? "#0f766e" : "#ffffff"}
+                      stroke="#128477"
+                      strokeWidth={isCurrent ? 2 : 1.4}
+                    />
+                  </g>
+                );
+              })}
+            </svg>
+            <div className="mt-1 grid text-[11px] font-semibold text-black/45" style={{ gridTemplateColumns: `repeat(${points.length}, 1fr)` }}>
+              {points.map((point, index) => (
+                <span key={`${point.from}-${point.to}-${index}-label`} className="truncate text-center">
+                  {shouldShowLabel(index) ? (point.isCurrent ? `${point.shortLabel} (Current)` : point.shortLabel) : ""}
+                </span>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+      <div className="mt-3 flex flex-wrap gap-2">
+        {points
+          .filter((point) => point.totalPaise > 0)
+          .map((point, index) => (
+            <button
+              key={`${point.from}-${point.to}-${index}-chip`}
+              type="button"
+              onClick={() => onPointClick(point)}
+              className="rounded-full border border-mint/15 bg-mint/10 px-2.5 py-1 text-xs font-semibold text-mint transition hover:bg-mint/15"
+            >
+              {point.label}: {formatInr(point.totalPaise)}
+            </button>
+          ))}
+      </div>
+    </div>
+  );
+}
+
+function YearlyExpensesPanel({
+  items,
+  maxTotalPaise
+}: {
+  items: Array<{ year: number; totalPaise: number }>;
+  maxTotalPaise: number;
+}) {
+  return (
+    <div className="rounded-md border border-black/10 bg-[#f9fbf8] px-3 py-3">
+      <p className="text-xs font-semibold uppercase tracking-[0.12em] text-black/45">Yearly expenses</p>
+      <div className="mt-3 grid gap-2">
+        {items.length === 0 ? (
+          <p className="rounded-md border border-dashed border-black/15 px-3 py-4 text-center text-sm text-black/50">
+            No yearly totals yet
+          </p>
+        ) : (
+          items.map((item) => (
+            <div key={item.year} className="grid gap-1.5">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-sm font-semibold text-ink">{item.year}</span>
+                <span className="text-sm font-semibold text-mint">{formatInr(item.totalPaise)}</span>
+              </div>
+              <div className="h-2 overflow-hidden rounded-full bg-black/5">
+                <div
+                  className="h-full rounded-full bg-coral transition-all"
+                  style={{
+                    width: `${Math.max(6, (item.totalPaise / maxTotalPaise) * 100)}%`
+                  }}
+                />
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
   );
 }
 

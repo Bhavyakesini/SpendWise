@@ -25,6 +25,8 @@ function validationError(error: unknown): ServiceResult {
 export async function listExpenses(searchParams: URLSearchParams): Promise<ServiceResult> {
   const parsed = expensesQuerySchema.safeParse({
     category: searchParams.get("category") || undefined,
+    date_from: searchParams.get("date_from") || undefined,
+    date_to: searchParams.get("date_to") || undefined,
     sort: searchParams.get("sort") || undefined
   });
 
@@ -32,8 +34,10 @@ export async function listExpenses(searchParams: URLSearchParams): Promise<Servi
     return validationError(parsed.error.flatten());
   }
 
+  const where = buildWhere(parsed.data);
+
   const expenses = await prisma.expense.findMany({
-    where: parsed.data.category ? { category: parsed.data.category } : undefined,
+    where,
     orderBy: buildOrderBy(parsed.data.sort),
     include: {
       splitShares: {
@@ -52,6 +56,23 @@ export async function listExpenses(searchParams: URLSearchParams): Promise<Servi
       totalPaise
     }
   };
+}
+
+function buildWhere(query: { category?: string; date_from?: string; date_to?: string }): Prisma.ExpenseWhereInput | undefined {
+  const where: Prisma.ExpenseWhereInput = {};
+
+  if (query.category) {
+    where.category = query.category;
+  }
+
+  if (query.date_from || query.date_to) {
+    where.date = {
+      ...(query.date_from ? { gte: parseExpenseDate(query.date_from) } : {}),
+      ...(query.date_to ? { lte: parseExpenseDate(query.date_to) } : {})
+    };
+  }
+
+  return Object.keys(where).length > 0 ? where : undefined;
 }
 
 function buildOrderBy(sort: "created_desc" | "date_desc" | "date_asc" | "amount_desc" | undefined) {

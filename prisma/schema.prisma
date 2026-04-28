@@ -3,15 +3,15 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
 model Expense {
   id              String       @id @default(cuid())
-  amountPaise     Int
+  amountPaise     Float
   category        String
-  description     String
+  description     String?
   date            DateTime
   createdAt       DateTime     @default(now())
   clientRequestId String?      @unique
@@ -26,7 +26,7 @@ model SplitShare {
   id          String    @id @default(cuid())
   expenseId   String
   friendName  String
-  amountPaise Int
+  amountPaise Float
   settledAt   DateTime?
   createdAt   DateTime  @default(now())
   expense     Expense   @relation(fields: [expenseId], references: [id], onDelete: Cascade)

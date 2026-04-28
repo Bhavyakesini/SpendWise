@@ -48,6 +48,8 @@ export const createExpenseSchema = z.object({
 
 export const expensesQuerySchema = z.object({
   category: z.string().trim().optional(),
+  date_from: dateOnlySchema.optional(),
+  date_to: dateOnlySchema.optional(),
   sort: z.enum(["created_desc", "date_desc", "date_asc", "amount_desc"]).optional()
 });
 
