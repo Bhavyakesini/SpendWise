@@ -9,7 +9,7 @@ datasource db {
 
 model Expense {
   id              String       @id @default(cuid())
-  amountPaise     Float
+  amountPaise     Int
   category        String
   description     String?
   date            DateTime
@@ -26,7 +26,7 @@ model SplitShare {
   id          String    @id @default(cuid())
   expenseId   String
   friendName  String
-  amountPaise Float
+  amountPaise Int
   settledAt   DateTime?
   createdAt   DateTime  @default(now())
   expense     Expense   @relation(fields: [expenseId], references: [id], onDelete: Cascade)

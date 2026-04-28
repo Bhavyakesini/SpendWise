@@ -263,6 +263,30 @@ async function readJsonError(response: Response) {
   return payload?.error || "Something went wrong.";
 }
 
+function normalizeExpensesResponse(data: unknown): ExpensesResponse {
+  const objectData = data && typeof data === "object" && !Array.isArray(data) ? data : null;
+  const responseData = objectData as Partial<ExpensesResponse> | null;
+  const expenses = Array.isArray(data)
+    ? (data as Expense[])
+    : Array.isArray(responseData?.expenses)
+      ? responseData.expenses
+      : [];
+  const computedTotalPaise = expenses.reduce((sum, expense) => {
+    const amountPaise = typeof expense.amountPaise === "number" && Number.isFinite(expense.amountPaise) ? expense.amountPaise : 0;
+    return sum + amountPaise;
+  }, 0);
+  const totalPaise =
+    typeof responseData?.totalPaise === "number" && Number.isFinite(responseData.totalPaise)
+      ? responseData.totalPaise
+      : computedTotalPaise;
+
+  return {
+    expenses,
+    total: typeof responseData?.total === "string" ? responseData.total : (totalPaise / 100).toFixed(2),
+    totalPaise
+  };
+}
+
 async function fetchExpenses(category: string, sort: SortKey, dateFilter?: DateFilter | null): Promise<ExpensesResponse> {
   const params = new URLSearchParams();
 
@@ -285,7 +309,8 @@ async function fetchExpenses(category: string, sort: SortKey, dateFilter?: DateF
     throw new Error(await readJsonError(response));
   }
 
-  return response.json();
+  const data = await response.json();
+  return normalizeExpensesResponse(data);
 }
 
 async function fetchSettlements(): Promise<{ settlements: Settlement[] }> {
@@ -510,8 +535,8 @@ export default function Home() {
     queryFn: fetchSettlements
   });
 
-  const visibleExpenses = expensesQuery.data?.expenses ?? [];
-  const allExpenses = allExpensesQuery.data?.expenses ?? [];
+  const visibleExpenses = Array.isArray(expensesQuery.data?.expenses) ? expensesQuery.data.expenses : [];
+  const allExpenses = Array.isArray(allExpensesQuery.data?.expenses) ? allExpensesQuery.data.expenses : [];
   const settlements = settlementsQuery.data?.settlements ?? [];
   const showSettlements = settlementsQuery.isLoading || settlements.length > 0;
   const splitFriends = useMemo(() => uniqueNames(splitNames), [splitNames]);
